@@ -3,3 +3,6 @@
 
 #Ignore the /makemore directory
 /makemore
+
+#Ignore the spaceship_titanic challenge
+/spaceship_titanic
