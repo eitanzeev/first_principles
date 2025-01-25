@@ -7,8 +7,8 @@ torch.manual_seed(1337)
 #hyperparameters section
 batch_size = 32 #How many independent sequences of characters will we process in parallel
 context_length = 8 #-Cody's version of block size. What is the maximum context length for predictions
-max_iters = 3000 #500#3000
-eval_interval = 12
+max_iters = 500#3000
+eval_interval = 100
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
@@ -100,23 +100,86 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias = False)
         self.head_size = head_size
         
-        #creating a variable tril for the model
+        #creating a variable tril for the model as it is not a inherent parameter for the model
         self.register_buffer('tril',torch.tril(torch.ones(context_length, context_length)))
         
     def forward(self, x):
         B,T,C = x.shape
         
-        k = self.key(x)
-        q = self.query(x)
+        k = self.key(x) #(B,T,C)
+        q = self.query(x) #(B,T,C)
         v = self.value(x)
         
-        weights = q@k.transpose(-2,-1) *self.head_size*80.5
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        weights = F.softmax(weights, dim = -1)        
+        #Calculate the affinities
+        weights = q@k.transpose(-2,-1) *self.head_size*0.5 #(B,T,C) @ (B,C,T) -> (B,T,T)
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) #Only look backwards: (B,T,T)
+        weights = F.softmax(weights, dim = -1) # (B,T,T)       
         
-        v = self.value(x)
-        out = weights@v
+        #perform the weighted aggregation of the values
+        v = self.value(x) #(B,T,C)
+        out = weights@v #(B,T,T)@(B,T,C) -> (B,T,C)
         return out        
+        
+class MultiHeadAttention(nn.Module):
+    
+    def __init__(self,  num_heads, head_size):
+        super().__init__()
+        #Create a list of the heads of attention
+        self.heads = nn.ModuleList([Head(head_size) for i in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+    def forward(self, x):
+        
+        #Calculate the heads of attention and then concatenate along the last dimension - the channel dimension
+        mlt_head = torch.cat([head(x) for head in self.heads], dim = -1)
+        out = self.proj(mlt_head) #projection back into the residual layer
+        return out
+    
+class FeedForward(nn.Module):
+    
+    #Linear layer followed by non=linear
+    
+    def __init__(self, n_embd):
+        super().__init__()
+        
+        ##Separated projection layer
+        self.feedforward = nn.Sequential(
+            nn.Linear(in_features = n_embd, out_features = n_embd, bias = False),
+            nn.ReLU(),
+            
+            )
+        self.proj = nn.Linear(n_embd, n_embd)
+        
+        ##Non-separated projection layer
+        # self.feedforward = nn.Sequential(
+        #     nn.Linear(in_features = n_embd, out_features = n_embd, bias = False),
+        #     nn.ReLU(),
+        #     nn.Linear(n_embd, n_embd)
+        #     )
+        
+    def forward(self, x):
+        
+        ##Separated projection layer
+        ffwd = self.feedforward(x)
+        out = self.proj(ffwd)
+        
+        ##Non-separated projection layer
+        #ffwd = self.feedforward(x)
+        return out
+    
+class Block(nn.Module):
+    
+    def __init__(self, num_heads):
+        super().__init__()
+        
+        head_size = n_embd//num_heads
+        
+        self.multihead = MultiHeadAttention(num_heads, head_size)
+        self.ffwd = FeedForward(n_embd)
+        
+    def forward(self):
+        x = x + self.multihead(x) #add residual connections to preserve gradient flows in case multi-head or feedforward fail
+        x = x + self.ffwd(x)  #add residual connections to preserve gradient flows in case multi-head or feedforward fail
+        return x
         
 #Modle structure
 class BigramLanguageModel(nn.Module):
@@ -127,11 +190,19 @@ class BigramLanguageModel(nn.Module):
         #Create embedding table where each index(representing individual characters) 
         # will pull out a row from the embedding table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #n_embd is number of embeddings per token
-        
         #Create embedding table for position encodings
         self.position_embedding_table = nn.Embedding(context_length, n_embd) #we encode each position in a n_embd dimension vector
-        self.sa_head = Head(n_embd) #define a single head of attention
-        self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer taking embeddings to logits
+        
+        self.attention_blocks = nn.Sequential(Block(n_embd, n_head = 4),
+                                    Block(n_embd, n_head = 4),
+                                    Block(n_embd, n_head = 4))
+        #A
+        #self.sa_head = Head(n_embd) #define a single head of attention
+        #self.sa_heads = MultiHeadAttention(num_heads = 4, head_size = n_embd//4) #i.e. 4 heads (communication channels looking at same 32 dimension vector) of 8-dimensional self-attention
+        
+        ##feedforward
+        #self.feedforward = FeedForward(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer taking embeddings to logits - serves as the decoding layer
         
         
     def forward(self, idx, targets = None):
@@ -147,8 +218,15 @@ class BigramLanguageModel(nn.Module):
         
         #Combine the impact of the token and position embeddings
         comb_embd = token_embeddings + pos_emb #new dimension added with broadcasting
-        attention_result = self.sa_head(comb_embd) #aplpy one head of attention
-        logits = self.lm_head(comb_embd) #B,T,vocab_size)
+        
+        
+        #attention_result = self.sa_heads(comb_embd) #apply one instance of attention
+        #use blocks of attention
+        attention_block_result = self.attention_blocks(comb_embd)
+        
+        #Apply the feedforward network
+        out = self.feedforward(attention_block_result)
+        logits = self.lm_head(out) #B,T,vocab_size)
         
         
         
@@ -174,8 +252,7 @@ class BigramLanguageModel(nn.Module):
             """Crop the index to the last context_length of tokens. 
             We can't have more than context length coming in from idx 
             otherwise the embedding table will known out of scope"""
-            
-            idx_cond= idx[:, -context_length]
+            idx_cond= idx[:, -context_length:]
             logits, loss = self(idx_cond)
             
             #focus only on the last example (where we consider the max token length TODO: Understand why here)
