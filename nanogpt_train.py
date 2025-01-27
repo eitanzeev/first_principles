@@ -14,8 +14,10 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
 dropout = 0.2
-num_blocks = 5
-num_heads = 4
+num_blocks = 6
+num_heads = 6
+
+#---
 
 #TRain a transformer
 
