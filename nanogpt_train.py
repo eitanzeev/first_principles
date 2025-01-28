@@ -14,7 +14,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
 gen_dropout = 0.2
-num_blocks = 6
+num_blocks = 2
 num_heads = 6
 attn_dropout = 0.2
 residual_cxn_dropout = 0.2
@@ -26,41 +26,6 @@ residual_cxn_dropout = 0.2
 
 # We always start with a dataset to train on. Let's download the tiny shakespeare dataset
 #!wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt 
-
-#Get the input text
-with open('input.txt', 'r', encoding = 'utf-8') as f:
-    text = f.read()
-    
-#What is the length of the dataset in characters
-#print(f"length of the dataset in characters: {len(text)}")
-
-
-##Sort the text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-all_chars = ''.join(chars)
-
-print(f"All Chars: {all_chars}")
-print(f"Total number: {vocab_size} chars")
-
-
-#Lets work on tokenization
-
-stoi = {ch:i for i,ch in enumerate(chars)}
-itos = {i:ch for i,ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: [itos[c] for c in l]
-
-
-data = torch.tensor(encode(text), dtype = torch.long)
-#print("Every integer in data represents a single character ", data.shape)
-
-
-#Train and Test Splits
-n = int(0.9*len(data))
-
-train_data = data[:n]
-val_data = data[n:]
 
 
 #Batch splitting
@@ -99,7 +64,10 @@ def estimate_loss():
     return out
 
 class CausalSelfAttention(nn.Module):
-    def __init__(head_size, n_embd):
+    def __init__(self, head_size, n_embd, dropout):
+        
+        super().__init__()
+        
         kqv = nn.Linear(n_embd, n_embd*3, bias = False)
         #creating a variable tril for the model as it is not a inherent parameter for the model
         self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length))\
@@ -115,7 +83,7 @@ class CausalSelfAttention(nn.Module):
         
         B,T,C = x.shape
         
-        q,k,v = kqv(x).split(n_embd, 2)
+        q,k,v = self.kqv(x).split(n_embd, 2)
 
         #adjust queries to have the head dimension 
         k = k.view(B,T, num_heads,C//num_heads).transpose(1,2) #B,T,C -> B,T,nH, C -> B,nH,T,C
@@ -142,7 +110,7 @@ class CausalSelfAttention(nn.Module):
         
         return output
     
-class MLP(nn.Module()):
+class MLP(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         
@@ -154,7 +122,7 @@ class MLP(nn.Module()):
         upscale = nn.Linear(n_embd, n_embd * 4, bias = False)
         nonlinear = nn.GELU()
         downscale = nn.Linear(n_embd*4, bias = False)
-        dropout = nn.Dropout(general_dropout)
+        dropout = nn.Dropout(gen_dropout)
         
         self.sequential_MLP = nn.Sequential(upscale, nonlinear, downscale, dropout)
         
@@ -168,7 +136,7 @@ class Block(nn.Module):
         
         head_size = n_embd//num_heads
         
-        self.multihead_attention = CasualSelfAttention(num_heads, head_size)
+        self.multihead_attention = CausalSelfAttention(num_heads, head_size)
         self.ln1 = LayerNorm(n_embd)
         self.MLP = MLP(n_embd)
         self.ln2 = LayerNorm(n_embd)
@@ -182,7 +150,7 @@ class Block(nn.Module):
     
 class LayerNorm(nn.Module): # (used to be BatchNorm1d)
 
-    def __init__(self, ndim, eps=1e-5, momentum=0.1):
+    def __init__(self, ndim, eps=1e-5, momentum=0.1, bias = False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim) if bias else None) #bias is normally nothing
@@ -205,16 +173,10 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #n_embd is number of embeddings per token
         #Create embedding table for position encodings
         self.position_embedding_table = nn.Embedding(context_length, n_embd) #we encode each position in a n_embd dimension vector
-        
-        # self.attention_blocks = nn.Sequential(Block(n_embd, num_heads = 4),
-        #                             Block(n_embd, num_heads = 4),
-        #                             Block(n_embd, num_heads = 4))
         self.attention_blocks = nn.Sequential(*[Block(n_embd, num_heads=num_heads) for i in range(num_blocks)])
-
-        ##feedforward
-        #self.feedforward = FeedForward(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer taking embeddings to logits - serves as the decoding layer
+        #linear layer taking embeddings to logits - serves as the decoding layer
         
+        self.lm_head = nn.Linear(n_embd, vocab_size) 
         
     def forward(self, idx, targets = None):
         
@@ -236,8 +198,6 @@ class BigramLanguageModel(nn.Module):
         attention_block_result = self.attention_blocks(comb_embd)
         
         logits = self.lm_head(attention_block_result) #B,T,vocab_size)
-        
-        
         
         if targets is None: 
             loss = None
