@@ -13,9 +13,12 @@ learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
-dropout = 0.2
+gen_dropout = 0.2
 num_blocks = 6
 num_heads = 6
+attn_dropout = 0.2
+residual_cxn_dropout = 0.2
+
 
 #---
 
@@ -95,97 +98,69 @@ def estimate_loss():
     model.train()
     return out
 
-
-#Adding the head class
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias = False)
-        self.query = nn.Linear(n_embd, head_size, bias = False)#We don't typically use bias here
-        self.value = nn.Linear(n_embd, head_size, bias = False)
-        self.head_size = head_size
-        
+class CausalSelfAttention(nn.Module):
+    def __init__(head_size, n_embd):
+        kqv = nn.Linear(n_embd, n_embd*3, bias = False)
         #creating a variable tril for the model as it is not a inherent parameter for the model
-        self.register_buffer('tril',torch.tril(torch.ones(context_length, context_length)))
-        
-        
+        self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length))\
+                                    .view(1,1,context_length, context_length))
         self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.residual_dropout = nn.Dropout(residual_cxn_dropout)
+        
+        self.projection = nn.Linear(n_embd, n_embd)
+        
+    
     def forward(self, x):
+        
         B,T,C = x.shape
         
-        k = self.key(x) #(B,T,C)
-        q = self.query(x) #(B,T,C)
-        v = self.value(x)
+        q,k,v = kqv(x).split(n_embd, 2)
+
+        #adjust queries to have the head dimension 
+        k = k.view(B,T, num_heads,C//num_heads).transpose(1,2) #B,T,C -> B,T,nH, C -> B,nH,T,C
+        q = q.view(B,T,num_heads,C//num_heads).transpose(1,2)
+        v = v.view(B,T,num_heads, C//num_heads).transpose(1,2)
         
-        #Calculate the affinities
-        weights = q@k.transpose(-2,-1) *self.head_size*0.5 #(B,T,C) @ (B,C,T) -> (B,T,T)
-        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) #Only look backwards: (B,T,T)
-        weights = F.softmax(weights, dim = -1) # (B,T,T)    
+        attention = (q@k.transpose(-1,-2))*(head_size**0.5)
         
-        weights = self.dropout(weights)   
+        attention = attention.masked_fill(tril[:,:,:T,:T] == 0, float('-inf'))
+        attention = F.softmax(attention, dim = -1)
         
-        #perform the weighted aggregation of the values
-        v = self.value(x) #(B,T,C)
-        out = weights@v #(B,T,T)@(B,T,C) -> (B,T,C)
-        return out        
+        #Apply dropout
+        attention = attn_dropout(attention)
         
-class MultiHeadAttention(nn.Module):
+        
+        #value multiplication to 'catch' the attention weights
+        #B,nH, T,T -> B, nH, T, C
+        output = attention@v 
+        
+        #turn the data into continuous stream and effectively concatenate all of the heads again
+        output = output.transpose(1,2).reshape(B,T,C)
+        
+        output = self.residual_dropout(self.projection(output))
+        
+        return output
     
-    def __init__(self,  num_heads, head_size):
-        super().__init__()
-        #Create a list of the heads of attention
-        self.heads = nn.ModuleList([Head(head_size) for i in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        
-        #Calculate the heads of attention and then concatenate along the last dimension - the channel dimension
-        mlt_head = torch.cat([head(x) for head in self.heads], dim = -1)
-        out = self.proj(mlt_head) #projection back into the residual layer
-        out = self.dropout(out)
-        return out
-    
-class FeedForward(nn.Module):
-    
-    #Linear layer followed by non=linear
-    
+class MLP(nn.Module()):
     def __init__(self, n_embd):
         super().__init__()
         
-        
+               
         """Note the up projection in feedforward layers with the projection component!
         This just directly mimics what we saw from the Attention is All you Need paper
         """
         
-        ##Separated projection layer
-        self.feedforward = nn.Sequential(
-            nn.Linear(n_embd, 4*n_embd, bias = False),
-            nn.ReLU(),
-            
-            )
-        self.proj = nn.Linear(4*n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        upscale = nn.Linear(n_embd, n_embd * 4, bias = False)
+        nonlinear = nn.GELU()
+        downscale = nn.Linear(n_embd*4, bias = False)
+        dropout = nn.Dropout(general_dropout)
         
-        ##Non-separated projection layer
-        # self.feedforward = nn.Sequential(
-        #     nn.Linear(n_embd,  4*n_embd, bias = False),
-        #     nn.ReLU(),
-        #     nn.Linear(4*n_embd, n_embd)
-        #     nn.Dropout(dropout)
-        #     )
+        self.sequential_MLP = nn.Sequential(upscale, nonlinear, downscale, dropout)
         
     def forward(self, x):
-        
-        ##Separated projection layer
-        ffwd = self.feedforward(x)
-        out = self.proj(ffwd)
-        out = self.dropout(out)
-        
-        ##Non-separated projection layer
-        #ffwd = self.feedforward(x)
-        return out
-    
+        return self.sequential_MLP(x)
+            
 class Block(nn.Module):
     
     def __init__(self,n_embd, num_heads):
@@ -193,37 +168,32 @@ class Block(nn.Module):
         
         head_size = n_embd//num_heads
         
-        self.multihead = MultiHeadAttention(num_heads, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.multihead_attention = CasualSelfAttention(num_heads, head_size)
+        self.ln1 = LayerNorm(n_embd)
+        self.MLP = MLP(n_embd)
+        self.ln2 = LayerNorm(n_embd)
         
     def forward(self, x):
        
         #Apply layer normalization PRIOR to attention and feedforward
-
-        x = x + self.multihead(self.ln1(x)) #add residual connections to preserve gradient flows in case multi-head or feedforward fail
-        x = x + self.ffwd(self.ln2(x))  #add residual connections to preserve gradient flows in case multi-head or feedforward fail
+        x = x + self.multihead_attention(self.ln1(x)) #add residual connections to preserve gradient flows in case multi-head or feedforward fail
+        x = x + self.MLP(self.ln2(x))  #add residual connections to preserve gradient flows in case multi-head or feedforward fail
         return x
     
-class LayerNorm1d: # (used to be BatchNorm1d)
+class LayerNorm(nn.Module): # (used to be BatchNorm1d)
 
-  def __init__(self, dim, eps=1e-5, momentum=0.1):
-    self.eps = eps
-    self.gamma = torch.ones(dim)
-    self.beta = torch.zeros(dim)
-
-  def __call__(self, x):
-    # calculate the forward pass
-    xmean = x.mean(1, keepdim=True) # layer mean (note that we are summing across the row not per column like with batch)
-    xvar = x.var(1, keepdim=True) # layer mean( note that we normalizing)
-    xhat = (x - xmean) / torch.sqrt(xvar + self.eps) # normalize to unit variance
-    self.out = self.gamma * xhat + self.beta
-    return self.out
-
-  def parameters(self):
-    return [self.gamma, self.beta]
+    def __init__(self, ndim, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim) if bias else None) #bias is normally nothing
         
+    def forward(self, x):
+        #we normalize according to layer shape, which is represented by the weight.shape.
+        #each parameter here represents a learned representation
+        normed_output = F.layer_norm(x, self.weight.shape, self.weight, self.bias) 
+        
+        return normed_output
+
 #Modle structure
 class BigramLanguageModel(nn.Module):
     
@@ -240,10 +210,7 @@ class BigramLanguageModel(nn.Module):
         #                             Block(n_embd, num_heads = 4),
         #                             Block(n_embd, num_heads = 4))
         self.attention_blocks = nn.Sequential(*[Block(n_embd, num_heads=num_heads) for i in range(num_blocks)])
-        #A
-        #self.sa_head = Head(n_embd) #define a single head of attention
-        #self.sa_heads = MultiHeadAttention(num_heads = 4, head_size = n_embd//4) #i.e. 4 heads (communication channels looking at same 32 dimension vector) of 8-dimensional self-attention
-        
+
         ##feedforward
         #self.feedforward = FeedForward(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer taking embeddings to logits - serves as the decoding layer
