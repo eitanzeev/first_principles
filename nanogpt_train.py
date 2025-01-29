@@ -29,49 +29,13 @@ residual_cxn_dropout = 0.2
 # We always start with a dataset to train on. Let's download the tiny shakespeare dataset
 #!wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt 
 
-
-#Batch splitting
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - context_length, (batch_size,)) #tensor of four integers representing four characters from the text
-    # So for the random characters, we get i and then up to the block size. Then we put in a bigger tensor
-    x = torch.stack([data[i:i+context_length] for i in ix])
-    #same thing for y
-    y = torch.stack([data[i+1:i+context_length+1] for i in ix])
-    
-    #for gpu compatibility
-    x = x.to(device)
-    y= y.to(device)
-    
-    return x,y
-
-@torch.no_grad()#Everything that happens inside this function, don't keep track of grad on estimate loss
-def estimate_loss():
-    
-    """This function is used for switching between eval and train model to routinely
-    evaluate model performance"""
-    
-    out = {}
-    model.eval()
-    for split in ['train','val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X,Y = get_batch(split)
-            logits, loss = model(X,Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    
-    #Switch back to eval 
-    model.train()
-    return out
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, gptconfig):
         
         super().__init__()
         
         
-        kqv = nn.Linear(gptconfig.n_embd, gptconfig.n_embd*3, bias = False)
+        self.kqv = nn.Linear(gptconfig.n_embd, gptconfig.n_embd*3, bias = False)
         #creating a variable tril for the model as it is not a inherent parameter for the model
         self.register_buffer('tril', torch.tril(torch.ones(gptconfig.context_length, gptconfig.context_length))\
                                     .view(1,1, gptconfig.context_length, gptconfig.context_length))
@@ -90,7 +54,7 @@ class CausalSelfAttention(nn.Module):
         
         B,T,C = x.shape
         
-        q,k,v = self.kqv(x).split(gptconfig.n_embd, 2)
+        q,k,v = self.kqv(x).split(self.n_embd, 2)
 
         #adjust queries to have the head dimension 
         k = k.view(B,T, self.num_heads,C//self.num_heads).transpose(1,2) #B,T,C -> B,T,nH, C -> B,nH,T,C
@@ -99,11 +63,11 @@ class CausalSelfAttention(nn.Module):
         
         attention = (q@k.transpose(-1,-2))*(self.head_size**0.5)
         
-        attention = attention.masked_fill(tril[:,:,:T,:T] == 0, float('-inf'))
+        attention = attention.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf'))
         attention = F.softmax(attention, dim = -1)
         
         #Apply dropout
-        attention = attn_dropout(attention)
+        attention = self.attn_dropout(attention)
         
         
         #value multiplication to 'catch' the attention weights
@@ -128,7 +92,7 @@ class MLP(nn.Module):
         
         upscale = nn.Linear(gptconfig.n_embd, gptconfig.n_embd * 4, bias = False)
         nonlinear = nn.GELU()
-        downscale = nn.Linear(gptconfig.n_embd*4, bias = False)
+        downscale = nn.Linear(gptconfig.n_embd*4, gptconfig.n_embd, bias = False)
         dropout = nn.Dropout(gptconfig.gen_dropout)
         
         self.sequential_MLP = nn.Sequential(upscale, nonlinear, downscale, dropout)
@@ -141,12 +105,11 @@ class Block(nn.Module):
     def __init__(self, gptconfig):
         super().__init__()
         
-        head_size = gptconfig.n_embd//gptconfig.num_heads
         
         self.multihead_attention = CausalSelfAttention(gptconfig)
-        self.ln1 = LayerNorm(gptconfig)
+        self.ln1 = LayerNorm(gptconfig.n_embd)
         self.MLP = MLP(gptconfig)
-        self.ln2 = LayerNorm(gptconfig)
+        self.ln2 = LayerNorm(gptconfig.n_embd)
         
     def forward(self, x):
        
@@ -160,36 +123,37 @@ class LayerNorm(nn.Module): # (used to be BatchNorm1d)
     def __init__(self, ndim, eps=1e-5, momentum=0.1, bias = False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim) if bias else None) #bias is normally nothing
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None #bias is normally nothing
         
     def forward(self, x):
         #we normalize according to layer shape, which is represented by the weight.shape.
         #each parameter here represents a learned representation
-        normed_output = F.layer_norm(x, self.weight.shape, self.weight, self.bias) 
-        
+ 
+        normed_output = F.layer_norm(x, self.weight.shape, self.weight, self.bias if self.bias is not None else None) 
         return normed_output
 
-@dataclass
+
+
 class GPTConfig:
     
-    #hyperparameters section
-    batch_size = 64 #How many independent sequences of characters will we process in parallel
-    context_length = 256 #-Cody's version of block size. What is the maximum context length for predictions
-    max_iters = 3500#3000
-    eval_interval = 500
-    learning_rate = 3e-4
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    eval_iters = 200
-    n_embd = 384
-    gen_dropout = 0.2
-    num_blocks = 2
-    num_heads = 6
-    attn_dropout = 0.2
-    residual_cxn_dropout = 0.2
-    
-    
-
-
+    def __init__(self, **config):
+        # Hyperparameters section
+        self.batch_size = config.get('batch_size', 64)  # Parallel processing sequences
+        self.context_length = config.get('context_length', 256)  # Max context length
+        self.max_iters = config.get('max_iters', 3500)  # Number of training iterations
+        self.eval_interval = config.get('eval_interval', 500)  # Evaluation frequency
+        self.learning_rate = config.get('learning_rate', 3e-4)  # Learning rate
+        self.device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')  # Auto-detect device
+        self.eval_iters = config.get('eval_iters', 200)  # Iterations for evaluation
+        self.n_embd = config.get('n_embd', 384)  # Embedding dimension
+        self.gen_dropout = config.get('gen_dropout', 0.2)  # General dropout rate
+        self.num_blocks = config.get('num_blocks', 2)  # Number of transformer blocks
+        self.num_heads = config.get('num_heads', 6)  # Attention heads per block
+        self.attn_dropout = config.get('attn_dropout', 0.2)  # Attention dropout rate
+        self.residual_cxn_dropout = config.get('residual_cxn_dropout', 0.2)  # Dropout in residual connections
+        self.vocab_size = config.get('vocab_size', 65)
+        self.head_size = config.get('head_size',64)
+        
 #Modle structure
 class PrelimGPT(nn.Module):
     
@@ -211,10 +175,10 @@ class PrelimGPT(nn.Module):
         
         
         #linear layer taking embeddings to logits - serves as the decoding layer
-        self.lm_head = nn.Linear(gptconfig.n_embd., gptconfig.vocab_size) 
+        self.lm_head = nn.Linear(gptconfig.n_embd, gptconfig.vocab_size) 
         
         #Create all layers for easy structure
-        self.all_layers = nn.Sequential(full_transformer, lm_head)
+        self.all_layers = nn.Sequential(self.full_transformer, self.lm_head)
         
     def forward(self, idx, targets = None):
         
@@ -279,50 +243,51 @@ class PrelimGPT(nn.Module):
 
 
 if __name__ == "__main__":
-    ##Run the model
-    #Initiate the model
+    pass
+    # ##Run the model
+    # #Initiate the model
 
-    model = BigramLanguageModel()
-    m = model.to(device)
+    # model = BigramLanguageModel()
+    # m = model.to(device)
 
-    #create a PyTorch optimizer
-    optimizer = torch.optim.AdamW(params = m.parameters(), lr = learning_rate)
+    # #create a PyTorch optimizer
+    # optimizer = torch.optim.AdamW(params = m.parameters(), lr = learning_rate)
 
 
-    for _ in range(max_iters):
+    # for _ in range(max_iters):
         
-        #evaluate loss
-            if _ % eval_interval == 0:
-                losses = estimate_loss()
-                print(f"step {_}: train loss {losses['train']:4f}, val loss {losses['val']:.4f}")
+    #     #evaluate loss
+    #         if _ % eval_interval == 0:
+    #             losses = estimate_loss()
+    #             print(f"step {_}: train loss {losses['train']:4f}, val loss {losses['val']:.4f}")
             
-            #Get the batches
-            xb, yb = get_batch('train')
+    #         #Get the batches
+    #         xb, yb = get_batch('train')
             
-            #Run the forward pass
-            logits, loss = m(xb, yb)
+    #         #Run the forward pass
+    #         logits, loss = m(xb, yb)
             
-            #zero the gradients prior to running gradient calculations
-            optimizer.zero_grad(set_to_none=True)
+    #         #zero the gradients prior to running gradient calculations
+    #         optimizer.zero_grad(set_to_none=True)
             
-            #Calculate the gradients and use them to update the parameters
-            loss.backward()
+    #         #Calculate the gradients and use them to update the parameters
+    #         loss.backward()
             
-            #step the optimizer to update the parameters
-            optimizer.step()
+    #         #step the optimizer to update the parameters
+    #         optimizer.step()
         
         
         
-    #Generation section
-    # starting_index = torch.zeros((1,1), dtype = torch.long, device = device) #Kicking off generation with zero tensors
-    # sample_generated = m.generate(starting_index, max_new_tokens=100)
-    # print(f"sample generated: {sample_generated.shape}")
-    # #Sample generated works on the order of batches so we need to grab the return batch (it's effectively nested in a list)
-    # batch_of_interest = sample_generated[0]
+    # #Generation section
+    # # starting_index = torch.zeros((1,1), dtype = torch.long, device = device) #Kicking off generation with zero tensors
+    # # sample_generated = m.generate(starting_index, max_new_tokens=100)
+    # # print(f"sample generated: {sample_generated.shape}")
+    # # #Sample generated works on the order of batches so we need to grab the return batch (it's effectively nested in a list)
+    # # batch_of_interest = sample_generated[0]
 
-    #Turn it into a list and decode
-    #batch_of_interest = [str(x) for x in batch_of_interest]
-    context = torch.zeros((1,1), dtype = torch.long, device = device)
-    print(''.join(decode(m.generate(context, max_new_tokens = 500)[0].tolist())))
-    # decoded = decoder(''.join(batch_of_interest.tolist()))
-    # print(f"Post training result: {decoded}")
+    # #Turn it into a list and decode
+    # #batch_of_interest = [str(x) for x in batch_of_interest]
+    # context = torch.zeros((1,1), dtype = torch.long, device = device)
+    # print(''.join(decode(m.generate(context, max_new_tokens = 500)[0].tolist())))
+    # # decoded = decoder(''.join(batch_of_interest.tolist()))
+    # # print(f"Post training result: {decoded}")
