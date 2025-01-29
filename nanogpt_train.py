@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from dataclasses import dataclass
+
 
 torch.manual_seed(1337)
 
@@ -64,33 +66,38 @@ def estimate_loss():
     return out
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, head_size, n_embd, dropout):
+    def __init__(self, gptconfig):
         
         super().__init__()
         
-        kqv = nn.Linear(n_embd, n_embd*3, bias = False)
-        #creating a variable tril for the model as it is not a inherent parameter for the model
-        self.register_buffer('tril', torch.tril(torch.ones(context_length, context_length))\
-                                    .view(1,1,context_length, context_length))
-        self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = nn.Dropout(attn_dropout)
-        self.residual_dropout = nn.Dropout(residual_cxn_dropout)
         
-        self.projection = nn.Linear(n_embd, n_embd)
+        kqv = nn.Linear(gptconfig.n_embd, gptconfig.n_embd*3, bias = False)
+        #creating a variable tril for the model as it is not a inherent parameter for the model
+        self.register_buffer('tril', torch.tril(torch.ones(gptconfig.context_length, gptconfig.context_length))\
+                                    .view(1,1, gptconfig.context_length, gptconfig.context_length))
+        self.dropout = nn.Dropout(gptconfig.gen_dropout)
+        self.attn_dropout = nn.Dropout(gptconfig.attn_dropout)
+        self.residual_dropout = nn.Dropout(gptconfig.residual_cxn_dropout)
+        self.projection = nn.Linear(gptconfig.n_embd, gptconfig.n_embd)
+        
+        #To pass to forward
+        self.num_heads = gptconfig.num_heads
+        self.n_embd = gptconfig.n_embd
+        self.head_size =gptconfig.head_size
         
     
     def forward(self, x):
         
         B,T,C = x.shape
         
-        q,k,v = self.kqv(x).split(n_embd, 2)
+        q,k,v = self.kqv(x).split(gptconfig.n_embd, 2)
 
         #adjust queries to have the head dimension 
-        k = k.view(B,T, num_heads,C//num_heads).transpose(1,2) #B,T,C -> B,T,nH, C -> B,nH,T,C
-        q = q.view(B,T,num_heads,C//num_heads).transpose(1,2)
-        v = v.view(B,T,num_heads, C//num_heads).transpose(1,2)
+        k = k.view(B,T, self.num_heads,C//self.num_heads).transpose(1,2) #B,T,C -> B,T,nH, C -> B,nH,T,C
+        q = q.view(B,T,self.num_heads,C//self.num_heads).transpose(1,2)
+        v = v.view(B,T,self.num_heads, C//self.num_heads).transpose(1,2)
         
-        attention = (q@k.transpose(-1,-2))*(head_size**0.5)
+        attention = (q@k.transpose(-1,-2))*(self.head_size**0.5)
         
         attention = attention.masked_fill(tril[:,:,:T,:T] == 0, float('-inf'))
         attention = F.softmax(attention, dim = -1)
@@ -111,7 +118,7 @@ class CausalSelfAttention(nn.Module):
         return output
     
 class MLP(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, gptconfig):
         super().__init__()
         
                
@@ -119,10 +126,10 @@ class MLP(nn.Module):
         This just directly mimics what we saw from the Attention is All you Need paper
         """
         
-        upscale = nn.Linear(n_embd, n_embd * 4, bias = False)
+        upscale = nn.Linear(gptconfig.n_embd, gptconfig.n_embd * 4, bias = False)
         nonlinear = nn.GELU()
-        downscale = nn.Linear(n_embd*4, bias = False)
-        dropout = nn.Dropout(gen_dropout)
+        downscale = nn.Linear(gptconfig.n_embd*4, bias = False)
+        dropout = nn.Dropout(gptconfig.gen_dropout)
         
         self.sequential_MLP = nn.Sequential(upscale, nonlinear, downscale, dropout)
         
@@ -131,15 +138,15 @@ class MLP(nn.Module):
             
 class Block(nn.Module):
     
-    def __init__(self,n_embd, num_heads):
+    def __init__(self, gptconfig):
         super().__init__()
         
-        head_size = n_embd//num_heads
+        head_size = gptconfig.n_embd//gptconfig.num_heads
         
-        self.multihead_attention = CausalSelfAttention(num_heads, head_size)
-        self.ln1 = LayerNorm(n_embd)
-        self.MLP = MLP(n_embd)
-        self.ln2 = LayerNorm(n_embd)
+        self.multihead_attention = CausalSelfAttention(gptconfig)
+        self.ln1 = LayerNorm(gptconfig)
+        self.MLP = MLP(gptconfig)
+        self.ln2 = LayerNorm(gptconfig)
         
     def forward(self, x):
        
@@ -162,48 +169,79 @@ class LayerNorm(nn.Module): # (used to be BatchNorm1d)
         
         return normed_output
 
-#Modle structure
-class BigramLanguageModel(nn.Module):
+@dataclass
+class GPTConfig:
     
-    def __init__(self):
+    #hyperparameters section
+    batch_size = 64 #How many independent sequences of characters will we process in parallel
+    context_length = 256 #-Cody's version of block size. What is the maximum context length for predictions
+    max_iters = 3500#3000
+    eval_interval = 500
+    learning_rate = 3e-4
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    eval_iters = 200
+    n_embd = 384
+    gen_dropout = 0.2
+    num_blocks = 2
+    num_heads = 6
+    attn_dropout = 0.2
+    residual_cxn_dropout = 0.2
+    
+    
+
+
+#Modle structure
+class PrelimGPT(nn.Module):
+    
+    def __init__(self, gptconfig):
         super().__init__()
+        
         
         #Create embedding table where each index(representing individual characters) 
         # will pull out a row from the embedding table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #n_embd is number of embeddings per token
+        self.token_embedding_table = nn.Embedding(gptconfig.vocab_size, gptconfig.n_embd) #n_embd is number of embeddings per token
         #Create embedding table for position encodings
-        self.position_embedding_table = nn.Embedding(context_length, n_embd) #we encode each position in a n_embd dimension vector
-        self.attention_blocks = nn.Sequential(*[Block(n_embd, num_heads=num_heads) for i in range(num_blocks)])
-        #linear layer taking embeddings to logits - serves as the decoding layer
+        self.position_embedding_table = nn.Embedding(gptconfig.context_length, gptconfig.n_embd) #we encode each position in a n_embd dimension vector
+        self.attention_blocks = nn.Sequential(*[Block(gptconfig) for i in range(gptconfig.num_blocks)])
         
-        self.lm_head = nn.Linear(n_embd, vocab_size) 
+        #Create dictionary for attention blocks
+        self.full_transformer = nn.ModuleDict(dict(token_embedding = self.token_embedding_table, 
+                                                position_embedding = self.position_embedding_table,
+                                                attention_blocks = self.attention_blocks))
+        
+        
+        #linear layer taking embeddings to logits - serves as the decoding layer
+        self.lm_head = nn.Linear(gptconfig.n_embd., gptconfig.vocab_size) 
+        
+        #Create all layers for easy structure
+        self.all_layers = nn.Sequential(full_transformer, lm_head)
         
     def forward(self, idx, targets = None):
         
         B, T = idx.shape
-       
+        pos = torch.arange(T, device = device)
         #idx and targets are both (b, context_length) tensor of integers
-        #Create embedding table
-        token_embeddings = self.token_embedding_table(idx) #output is (B,T,C = n_embd)
         
+        #Create embedding table
+        token_embeddings = self.full_transformer.token_embedding(idx) #output is (B,T,C = n_embd)
         #Create embedding table for position encodings, each of T in context length is encoded to n_embd
-        pos_emb = self.position_embedding_table(torch.arange(T, device = device)) #T,C structure
+        pos_emb = self.full_transformer.position_embedding(pos) #T,C structure
         
         #Combine the impact of the token and position embeddings
         comb_embd = token_embeddings + pos_emb #new dimension added with broadcasting
         
-        
         #attention_result = self.sa_heads(comb_embd) #apply one instance of attention
         #use blocks of attention
-        attention_block_result = self.attention_blocks(comb_embd)
+        attention_block_result = self.full_transformer.attention_blocks(comb_embd)
         
+        #Linear layer projection to logits
         logits = self.lm_head(attention_block_result) #B,T,vocab_size)
         
         if targets is None: 
             loss = None
         else:
             B,T,C = logits.shape
-            logits = logits.view(B*T, C) #-> for cross entropy
+            logits = logits.view(B*T,C) #-> for cross entropy
             targets = targets.view(B*T) #reshaping
             
             #negative log likelihood
@@ -239,50 +277,52 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-##Run the model
-#Initiate the model
 
-model = BigramLanguageModel()
-m = model.to(device)
+if __name__ == "__main__":
+    ##Run the model
+    #Initiate the model
 
-#create a PyTorch optimizer
-optimizer = torch.optim.AdamW(params = m.parameters(), lr = learning_rate)
+    model = BigramLanguageModel()
+    m = model.to(device)
+
+    #create a PyTorch optimizer
+    optimizer = torch.optim.AdamW(params = m.parameters(), lr = learning_rate)
 
 
-for _ in range(max_iters):
-    
-    #evaluate loss
-        if _ % eval_interval == 0:
-            losses = estimate_loss()
-            print(f"step {_}: train loss {losses['train']:4f}, val loss {losses['val']:.4f}")
+    for _ in range(max_iters):
         
-        #Get the batches
-        xb, yb = get_batch('train')
+        #evaluate loss
+            if _ % eval_interval == 0:
+                losses = estimate_loss()
+                print(f"step {_}: train loss {losses['train']:4f}, val loss {losses['val']:.4f}")
+            
+            #Get the batches
+            xb, yb = get_batch('train')
+            
+            #Run the forward pass
+            logits, loss = m(xb, yb)
+            
+            #zero the gradients prior to running gradient calculations
+            optimizer.zero_grad(set_to_none=True)
+            
+            #Calculate the gradients and use them to update the parameters
+            loss.backward()
+            
+            #step the optimizer to update the parameters
+            optimizer.step()
         
-        #Run the forward pass
-        logits, loss = m(xb, yb)
         
-        #zero the gradients prior to running gradient calculations
-        optimizer.zero_grad(set_to_none=True)
         
-        #Calculate the gradients and use them to update the parameters
-        loss.backward()
-        
-        #step the optimizer to update the parameters
-        optimizer.step()
-    
-    
-    
-#Generation section
-# starting_index = torch.zeros((1,1), dtype = torch.long, device = device) #Kicking off generation with zero tensors
-# sample_generated = m.generate(starting_index, max_new_tokens=100)
-# print(f"sample generated: {sample_generated.shape}")
-# #Sample generated works on the order of batches so we need to grab the return batch (it's effectively nested in a list)
-# batch_of_interest = sample_generated[0]
+    #Generation section
+    # starting_index = torch.zeros((1,1), dtype = torch.long, device = device) #Kicking off generation with zero tensors
+    # sample_generated = m.generate(starting_index, max_new_tokens=100)
+    # print(f"sample generated: {sample_generated.shape}")
+    # #Sample generated works on the order of batches so we need to grab the return batch (it's effectively nested in a list)
+    # batch_of_interest = sample_generated[0]
 
-#Turn it into a list and decode
-#batch_of_interest = [str(x) for x in batch_of_interest]
-context = torch.zeros((1,1), dtype = torch.long, device = device)
-print(''.join(decode(m.generate(context, max_new_tokens = 500)[0].tolist())))
-# decoded = decoder(''.join(batch_of_interest.tolist()))
-# print(f"Post training result: {decoded}")
+    #Turn it into a list and decode
+    #batch_of_interest = [str(x) for x in batch_of_interest]
+    context = torch.zeros((1,1), dtype = torch.long, device = device)
+    print(''.join(decode(m.generate(context, max_new_tokens = 500)[0].tolist())))
+    # decoded = decoder(''.join(batch_of_interest.tolist()))
+    # print(f"Post training result: {decoded}")
